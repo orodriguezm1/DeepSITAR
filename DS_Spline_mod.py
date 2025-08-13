@@ -17,11 +17,11 @@ start_time = time()
 data_s = 500
 
 if data_s == 500:
-    df = pd.read_csv('data/simul_data_500_20.csv')
+    df = pd.read_csv('data/simul_data_500_20new.csv')
 if data_s == 1000:
-    df = pd.read_csv('data/simul_data_1000_20.csv')
+    df = pd.read_csv('data/simul_data_1000_20new.csv')
 if data_s == 5000:
-    df = pd.read_csv('data/simul_data_5000_20.csv')
+    df = pd.read_csv('data/simul_data_5000_20new.csv')
 
 t_s = int(data_s*0.8)
 # Parámetros iniciales
@@ -44,7 +44,7 @@ Y_training_1 = Y_raw - Y_mean
 f_mean = np.mean(f_raw)
 f_training_1 = f_raw - f_mean
 
-# Convertimos a tensores de TensorFlow
+# Convertimos a tensores de TensorFlow.
 X_training = tf.convert_to_tensor(X_training_1, dtype=tf.float32)[:t_s,:]
 Y_training = tf.convert_to_tensor(Y_training_1, dtype=tf.float32)[:t_s,:]
 f_training = tf.convert_to_tensor(f_training_1, dtype=tf.float32)[:t_s,:]
