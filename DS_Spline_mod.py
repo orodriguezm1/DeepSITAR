@@ -8,6 +8,19 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from time import time
 
+# --- CREACIÓN SEGURA DE CARPETAS ---
+from pathlib import Path
+
+BASE_DIR = Path.cwd()
+DATA_DIR = BASE_DIR / "data"
+PLOTS_DIR = BASE_DIR / "plots"
+RESULTS_DIR = BASE_DIR / "results"
+
+# Crea si no existen
+for d in (DATA_DIR, PLOTS_DIR, RESULTS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
 # Establecer semillas para reproducibilidad
 np.random.seed(420)
 tf.random.set_seed(420)

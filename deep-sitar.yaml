@@ -1,4 +1,4 @@
-name: deep-sitar3
+name: deep-sitar
 channels:
   - defaults
 dependencies:
