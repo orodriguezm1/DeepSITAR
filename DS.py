@@ -341,6 +341,7 @@ class MyDeepSITAR(tf.keras.Model):
 # ================================
 #  Entrenamiento principal
 # ================================
+bspline_layer.trainable = True   # <- congela el spline
 DeepSITAR = MyDeepSITAR(x_ref=X, spline_layer=bspline_layer, deep_model=model_deep)
 his_loss_train, his_loss_val = [], []
 
