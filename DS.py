@@ -51,9 +51,15 @@ train_frac = 0.8
 t_s = int(data_s * train_frac)
 
 # Entrenamiento multietapa
-epp = [5000, 5000]  # épocas por fase
-lr = [1e-3, 1e-4]   # learning rates por fase
-b_size = 100        # batch size
+#epp = [8000, 10000]  # épocas por fase
+#lr = [1e-3, 1e-4]   # learning rates por fase
+#b_size = 100        # batch size
+
+epp = [5000,7000, 10000] # Épocas para cada fase de entrenamiento
+#epp = [5000,5000, 5000] # Épocas para cada fase de entrenamiento
+lr = [1e-2, 1e-3, 1e-4]     # Tasas de aprendizaje para cada fase
+b_size = 100          # Tamaño del batch
+
 
 # ================================
 #  Carga y preparación de datos
@@ -156,15 +162,18 @@ def plot_loss(his_loss_train, his_loss_val, chain, lr_list, n_id=500, obs=20, nu
 # ================================
 #  Capa B-Spline
 # ================================
+# ================================
+#  Capa B-Spline (con opción de intercepto)
+# ================================
 class BSplineLayer(tf.keras.layers.Layer):
-    def __init__(self, num_seg, degree, domain, **kwargs):
+    def __init__(self, num_seg, degree, domain, use_intercept=True, **kwargs):
         super().__init__(**kwargs)
         self.num_seg = int(num_seg)
         self.degree = int(degree)
         self.domain = tuple(domain)
+        self.use_intercept = use_intercept
         self.num_bases = self.num_seg + self.degree  # control points
 
-        # Secuencia de knots extendida
         span = (self.domain[1] - self.domain[0])
         self.knots = np.linspace(
             self.domain[0] - self.degree * (span / self.num_seg),
@@ -172,10 +181,10 @@ class BSplineLayer(tf.keras.layers.Layer):
             self.num_bases + self.degree + 1
         ).astype(np.float32)
 
-        # Puntos de control (entrenables)
         self.control_points = tf.Variable(
             initial_value=tf.random.normal([self.num_bases, 1]),
-            trainable=True, name="control_points"
+            trainable=True,
+            name="control_points"
         )
 
     def bspline_basis_tensor(self, x, i, k):
@@ -196,20 +205,36 @@ class BSplineLayer(tf.keras.layers.Layer):
         return term1 + term2
 
     def call(self, inputs):
+        # Asegurar que inputs tenga 2D: [batch, features]
+        if len(inputs.shape) == 1:
+            inputs = tf.expand_dims(inputs, axis=-1)  # [batch, 1]
+
+        batch_size, num_features = tf.shape(inputs)[0], tf.shape(inputs)[1]
+
+        # Crear tensor splines [batch, features, num_bases]
         splines = []
         for i in range(self.num_bases):
-            splines.append(self.bspline_basis_tensor(inputs, i, self.degree))
-        splines = tf.stack(splines, axis=-1)   # [batch, num_bases]
-        weighted = tf.matmul(splines, self.control_points)  # [batch, 1]
-        return tf.squeeze(weighted, axis=-1)  # [batch]
+            b_i = self.bspline_basis_tensor(inputs, i, self.degree)  # [batch, features]
+            splines.append(b_i)
+        splines = tf.stack(splines, axis=-1)  # [batch, features, num_bases]
+
+        if not self.use_intercept:
+            splines = splines[:, :, 1:]  # excluir primera base
+            cp = self.control_points[1:]
+        else:
+            cp = self.control_points
+
+        weighted = tf.tensordot(splines, cp, axes=[[2], [0]])  # [batch, features, 1]
+        return tf.squeeze(weighted, axis=-1)  # [batch, features]
+
 
 # ================================
 #  Instancias de modelos
 # ================================
-num_seg = 5     # nodos
+num_seg = 8    # nodos
 degree = 3      # grado B-Spline
 
-bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain)
+bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, use_intercept=False)
 
 # --- Snapshot de pesos iniciales aleatorios (solo para plot comparativo inicial) ---
 init_cp = bspline_layer.control_points.numpy().copy()
@@ -274,8 +299,8 @@ plot_comparison(
 # Red neuronal (random effects a,b,c)
 inp_deep = 20
 out_deep = 3
-nodes_deep = [30, 30, out_deep]
-acts = ['tanh', 'tanh', 'linear']
+nodes_deep = [30, 30, 30,40,40, out_deep]
+acts = ['tanh', 'tanh', 'tanh', 'tanh', 'tanh', 'linear']
 
 model_deep = Sequential(name="DeepRandEffects")
 for i, (units, act) in enumerate(zip(nodes_deep, acts)):

@@ -115,54 +115,52 @@ def plot_loss(his_loss_train, his_loss_val, chain, lr, n_id=500, obs=20):
 
 
 class BSplineLayer(tf.keras.layers.Layer):
-    def __init__(self, num_seg, degree, domain, **kwargs):
+    def __init__(self, num_seg, degree, domain, use_intercept=True, **kwargs):
         super(BSplineLayer, self).__init__(**kwargs)
         self.num_seg = num_seg
         self.degree = degree
         self.domain = domain
+        self.use_intercept = use_intercept
         self.num_bases = num_seg + degree  # Number of basis functions (control points)
 
         # Generate the knot sequence with extra knots outside the domain
         self.knots = np.linspace(
             domain[0] - degree * (domain[1] - domain[0]) / num_seg,
             domain[1] + degree * (domain[1] - domain[0]) / num_seg,
-            self.num_bases + degree + 1  # Ensure enough knots for the degree and basis functions
+            self.num_bases + degree + 1
         ).astype(np.float32)
-
 
         # Control points (initialized randomly)
         self.control_points = tf.Variable(
-            initial_value=tf.random.normal([self.num_bases, 1]),  # Matches the number of basis functions
+            initial_value=tf.random.normal([self.num_bases, 1]),
             trainable=True
         )
 
     def bspline_basis_tensor(self, x, i, k):
         """Compute B-spline basis function recursively using TensorFlow."""
-        # Base case: degree 0 B-spline basis functions
         if k == 0:
             return tf.cast((self.knots[i] <= x) & (x < self.knots[i + 1]), tf.float32)
         else:
-            # Ensure not to access out-of-bounds knots
             denom1 = self.knots[i + k] - self.knots[i] + 1e-8
             denom2 = self.knots[i + k + 1] - self.knots[i + 1] + 1e-8
-
-            # Safe recursion using `tf.where` to handle bounds
             term1 = tf.where(denom1 > 0, (x - self.knots[i]) / denom1 * self.bspline_basis_tensor(x, i, k - 1), 0.0)
             term2 = tf.where(denom2 > 0, (self.knots[i + k + 1] - x) / denom2 * self.bspline_basis_tensor(x, i + 1, k - 1), 0.0)
             return term1 + term2
 
     def call(self, inputs):
         # Compute B-spline basis matrix
-        splines = []
-        for i in range(self.num_bases):  # num_bases corresponds to num_seg + degree
-            spline = self.bspline_basis_tensor(inputs, i, self.degree)
-            splines.append(spline)
+        splines = [self.bspline_basis_tensor(inputs, i, self.degree) for i in range(self.num_bases)]
         splines = tf.stack(splines, axis=-1)
 
-        # Compute weighted sum of splines with control points
-        weighted_splines = tf.matmul(splines, self.control_points)
-        return tf.squeeze(weighted_splines, axis=-1)
+        if not self.use_intercept:
+            # Exclude the first basis to avoid intercept
+            splines = splines[:, 1:]
+            control_points = self.control_points[1:]
+        else:
+            control_points = self.control_points
 
+        weighted_splines = tf.matmul(splines, control_points)
+        return tf.squeeze(weighted_splines, axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +173,7 @@ degree = 3  # Grado del B-Spline
 domain = [-4.5, 4.5]  # Dominio de la función
 
 # Crear la capa B-Spline
-bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain)
+bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, use_intercept=True)
 
 # Llamar a la función con algunos valores de entrada
 
@@ -312,9 +310,7 @@ plt.show()
 
 #-------------------------------------------
 
-
-
-bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain)
+bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, use_intercept=True)
 
 # Generate a range of input values over the domain
 x_values = np.linspace(domain[0]-4, domain[1]+4, 100)
