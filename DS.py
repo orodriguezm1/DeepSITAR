@@ -55,9 +55,9 @@ t_s = int(data_s * train_frac)
 #lr = [1e-3, 1e-4]   # learning rates por fase
 #b_size = 100        # batch size
 
-epp = [5000,7000, 10000] # Épocas para cada fase de entrenamiento
+epp = [5000,8000] # Épocas para cada fase de entrenamiento
 #epp = [5000,5000, 5000] # Épocas para cada fase de entrenamiento
-lr = [1e-2, 1e-3, 1e-4]     # Tasas de aprendizaje para cada fase
+lr = [1e-2, 1e-3]     # Tasas de aprendizaje para cada fase
 b_size = 100          # Tamaño del batch
 
 
@@ -163,15 +163,16 @@ def plot_loss(his_loss_train, his_loss_val, chain, lr_list, n_id=500, obs=20, nu
 #  Capa B-Spline
 # ================================
 # ================================
-#  Capa B-Spline (con opción de intercepto)
+#  Capa B-Spline (con opción de intercepto y natural spline)
 # ================================
 class BSplineLayer(tf.keras.layers.Layer):
-    def __init__(self, num_seg, degree, domain, use_intercept=True, **kwargs):
+    def __init__(self, num_seg, degree, domain, use_intercept=True, natural=False, **kwargs):
         super().__init__(**kwargs)
         self.num_seg = int(num_seg)
         self.degree = int(degree)
         self.domain = tuple(domain)
         self.use_intercept = use_intercept
+        self.natural = natural
         self.num_bases = self.num_seg + self.degree  # control points
 
         span = (self.domain[1] - self.domain[0])
@@ -218,20 +219,23 @@ class BSplineLayer(tf.keras.layers.Layer):
             splines.append(b_i)
         splines = tf.stack(splines, axis=-1)  # [batch, features, num_bases]
 
+        cp = self.control_points
         if not self.use_intercept:
             splines = splines[:, :, 1:]  # excluir primera base
-            cp = self.control_points[1:]
-        else:
-            cp = self.control_points
+            cp = cp[1:]
+
+        if self.natural:
+            # Restricción natural: eliminar dos últimas bases para linealidad en extremos
+            splines = splines[:, :, :-2]
+            cp = cp[:-2]
 
         weighted = tf.tensordot(splines, cp, axes=[[2], [0]])  # [batch, features, 1]
         return tf.squeeze(weighted, axis=-1)  # [batch, features]
 
-
 # ================================
 #  Instancias de modelos
 # ================================
-num_seg = 8    # nodos
+num_seg = 5  # nodos
 degree = 3      # grado B-Spline
 
 bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, use_intercept=False)
@@ -299,8 +303,8 @@ plot_comparison(
 # Red neuronal (random effects a,b,c)
 inp_deep = 20
 out_deep = 3
-nodes_deep = [30, 30, 30,40,40, out_deep]
-acts = ['tanh', 'tanh', 'tanh', 'tanh', 'tanh', 'linear']
+nodes_deep = [15, out_deep]
+acts = ['tanh',  'linear']
 
 model_deep = Sequential(name="DeepRandEffects")
 for i, (units, act) in enumerate(zip(nodes_deep, acts)):
@@ -427,6 +431,7 @@ ax.plot(x_values, y_trained, linewidth=2, label='Trained B-spline Curve')
 ax.set_title('Trained B-spline Curve and Basis Functions')
 ax.set_xlabel('x'); ax.set_ylabel('Output'); ax.legend(); ax.grid(True)
 save_and_show(fig, PLOTS_DIR / f'trained_bspline_curve_{num_seg}.pdf')
+
 
 # Otra comparación puntual
 dat = 50  # o 170
