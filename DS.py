@@ -55,9 +55,9 @@ t_s = int(data_s * train_frac)
 #lr = [1e-3, 1e-4]   # learning rates por fase
 #b_size = 100        # batch size
 
-epp = [5000,8000] # Épocas para cada fase de entrenamiento
+epp = [5000,8000, 10000] # Épocas para cada fase de entrenamiento
 #epp = [5000,5000, 5000] # Épocas para cada fase de entrenamiento
-lr = [1e-2, 1e-3]     # Tasas de aprendizaje para cada fase
+lr =  [1e-3, 1e-4, 1e-5]     # Tasas de aprendizaje para cada fase
 b_size = 100          # Tamaño del batch
 
 
@@ -165,7 +165,16 @@ def plot_loss(his_loss_train, his_loss_val, chain, lr_list, n_id=500, obs=20, nu
 # ================================
 #  Capa B-Spline (con opción de intercepto y natural spline)
 # ================================
+import numpy as np
+import tensorflow as tf
+
 class BSplineLayer(tf.keras.layers.Layer):
+    """
+    B-spline con opción de 'natural=True' imponiendo f''(a)=0 y f''(b)=0.
+    Mantiene las bases B-spline (Cox–de Boor). La naturalidad se impone
+    parametrizando los coeficientes c = R @ theta, donde las columnas de R
+    generan el núcleo de C (C c = 0), con C_{j,i} = B_i''(x_j), j=1,2 (extremos).
+    """
     def __init__(self, num_seg, degree, domain, use_intercept=True, natural=False, **kwargs):
         super().__init__(**kwargs)
         self.num_seg = int(num_seg)
@@ -173,8 +182,13 @@ class BSplineLayer(tf.keras.layers.Layer):
         self.domain = tuple(domain)
         self.use_intercept = use_intercept
         self.natural = natural
-        self.num_bases = self.num_seg + self.degree  # control points
+        if self.natural and self.degree < 2:
+            raise ValueError("Natural spline requiere degree >= 2 (segunda derivada).")
 
+        # nº de funciones base (sin aplicar restricciones/intercepto)
+        self.num_bases = self.num_seg + self.degree
+
+        # Nudos (uniformes extendidos como en tu código)
         span = (self.domain[1] - self.domain[0])
         self.knots = np.linspace(
             self.domain[0] - self.degree * (span / self.num_seg),
@@ -182,13 +196,33 @@ class BSplineLayer(tf.keras.layers.Layer):
             self.num_bases + self.degree + 1
         ).astype(np.float32)
 
-        self.control_points = tf.Variable(
-            initial_value=tf.random.normal([self.num_bases, 1]),
-            trainable=True,
-            name="control_points"
-        )
+        # Variables entrenables: si natural -> parámetros reducidos; si no, coeficientes completos
+        if self.natural:
+            # R se construye en __init__ (en CPU) y se congela como constante
+            C = self._build_C_second_deriv_matrix(self.domain[0], self.domain[1])
+            R = self._null_space(C)  # [num_bases, num_bases-2]
+            if R.shape[1] != self.num_bases - 2:
+                # En casos degenerados numéricamente, caemos a QR para completar base
+                R = self._complete_basis_from_null(C)
 
+            # Chequeo: C @ R debe ser ~0 si las restricciones se cumplen
+            print("Chequeo restricción natural:")
+            print(C @ R)
+
+            self.R = tf.constant(R.astype(np.float32), dtype=tf.float32)
+            self.control_points_reduced = tf.Variable(
+                initial_value=tf.random.normal([self.num_bases - 2, 1], stddev=0.1),
+                trainable=True, name="control_points_reduced"
+            )
+        else:
+            self.control_points = tf.Variable(
+                initial_value=tf.random.normal([self.num_bases, 1], stddev=0.1),
+                trainable=True, name="control_points"
+            )
+
+    # ---------- Construcción base B-spline (Cox–de Boor) ----------
     def bspline_basis_tensor(self, x, i, k):
+        """Base B-spline B_{i,k}(x) con recursión de Cox–de Boor (vectorizada en x)."""
         if k == 0:
             return tf.cast((self.knots[i] <= x) & (x < self.knots[i + 1]), tf.float32)
         denom1 = self.knots[i + k] - self.knots[i] + 1e-8
@@ -205,37 +239,103 @@ class BSplineLayer(tf.keras.layers.Layer):
         )
         return term1 + term2
 
+    # ---------- Evaluación escalar (para derivadas en extremos) ----------
+    def _basis_scalar(self, x, i, k):
+        if k == 0:
+            return 1.0 if (self.knots[i] <= x < self.knots[i + 1]) else 0.0
+        denom1 = float(self.knots[i + k] - self.knots[i]) + 1e-8
+        denom2 = float(self.knots[i + k + 1] - self.knots[i + 1]) + 1e-8
+        t1 = ((x - float(self.knots[i])) / denom1) * self._basis_scalar(x, i, k - 1) if denom1 > 0 else 0.0
+        t2 = ((float(self.knots[i + k + 1]) - x) / denom2) * self._basis_scalar(x, i + 1, k - 1) if denom2 > 0 else 0.0
+        return t1 + t2
+
+    def _basis_deriv_scalar(self, x, i, k, d):
+        """
+        d-ésima derivada de B_{i,k} en x, escalar (para construir C).
+        Fórmula recursiva: B'_{i,k} = k/(t_{i+k}-t_i) B_{i,k-1} - k/(t_{i+k+1}-t_{i+1}) B_{i+1,k-1}
+        y para orden d>1, se aplica recursivamente.
+        """
+        if d == 0:
+            return self._basis_scalar(x, i, k)
+        if k == 0:
+            return 0.0
+        denom1 = float(self.knots[i + k] - self.knots[i]) + 1e-8
+        denom2 = float(self.knots[i + k + 1] - self.knots[i + 1]) + 1e-8
+        return (
+            k / denom1 * self._basis_deriv_scalar(x, i, k - 1, d - 1)
+            - k / denom2 * self._basis_deriv_scalar(x, i + 1, k - 1, d - 1)
+        )
+
+    # ---------- Matriz de restricciones y su núcleo ----------
+    def _build_C_second_deriv_matrix(self, a, b):
+        """Construye C de tamaño 2 x num_bases con C[j,i] = B_i''(x_j), x_1=a, x_2=b."""
+        C = np.zeros((2, self.num_bases), dtype=np.float64)
+        for i in range(self.num_bases):
+            C[0, i] = self._basis_deriv_scalar(a, i, self.degree, d=2)
+            # Para el extremo derecho, tratar el punto final como límite por la izquierda:
+            b_left = np.nextafter(b, -np.inf)
+            C[1, i] = self._basis_deriv_scalar(b_left, i, self.degree, d=2)
+        return C
+
+    def _null_space(self, C, rtol=1e-10):
+        """
+        Núcleo de C por SVD: devuelve matriz R (num_bases x m) cuyas columnas
+        forman una base del núcleo. m = num_bases - rank(C) (idealmente 2).
+        """
+        U, S, Vh = np.linalg.svd(C, full_matrices=True)
+        tol = rtol * max(C.shape) * (S[0] if S.size > 0 else 1.0)
+        null_mask = (S <= tol)
+        # Si rank=2, null tiene dimensión num_bases-2 -> tomamos últimas columnas de Vh
+        if null_mask.size >= 2:
+            rank = np.sum(~null_mask)
+        else:
+            rank = np.linalg.matrix_rank(C)
+        R = Vh[rank:].T  # columnas correspondientes al núcleo
+        return R
+
+    def _complete_basis_from_null(self, C):
+        """
+        Fallback robusto: si por numérica el SVD no dio exactamente dim núc = num_bases-2.
+        Usamos SVD pero forzamos a coger las últimas (num_bases-2) columnas de Vh.
+        """
+        U, S, Vh = np.linalg.svd(C, full_matrices=True)
+        want = self.num_bases - 2
+        R = Vh[-want:].T  # [num_bases, want]
+        return R
+
+    # ---------- Forward ----------
     def call(self, inputs):
-        # Asegurar que inputs tenga 2D: [batch, features]
+        # Asegurar entrada 2D: [batch, features]
         if len(inputs.shape) == 1:
-            inputs = tf.expand_dims(inputs, axis=-1)  # [batch, 1]
+            inputs = tf.expand_dims(inputs, axis=-1)
 
-        batch_size, num_features = tf.shape(inputs)[0], tf.shape(inputs)[1]
-
-        # Crear tensor splines [batch, features, num_bases]
+        # Construir tensor de bases: [batch, features, num_bases]
         splines = []
         for i in range(self.num_bases):
-            b_i = self.bspline_basis_tensor(inputs, i, self.degree)  # [batch, features]
-            splines.append(b_i)
-        splines = tf.stack(splines, axis=-1)  # [batch, features, num_bases]
+            splines.append(self.bspline_basis_tensor(inputs, i, self.degree))
+        splines = tf.stack(splines, axis=-1)
 
-        cp = self.control_points
-        if not self.use_intercept:
-            splines = splines[:, :, 1:]  # excluir primera base
-            cp = cp[1:]
-
+        # Coeficientes efectivos
         if self.natural:
-            # Restricción natural: eliminar dos últimas bases para linealidad en extremos
-            splines = splines[:, :, :-2]
-            cp = cp[:-2]
+            cp_full = tf.matmul(self.R, self.control_points_reduced)  # [num_bases, 1]
+        else:
+            cp_full = self.control_points  # [num_bases, 1]
+
+        # Intercepto: si no se usa, quitamos primera base en ambos lados
+        if not self.use_intercept:
+            splines = splines[:, :, 1:]
+            cp = cp_full[1:]
+        else:
+            cp = cp_full
 
         weighted = tf.tensordot(splines, cp, axes=[[2], [0]])  # [batch, features, 1]
         return tf.squeeze(weighted, axis=-1)  # [batch, features]
 
+
 # ================================
 #  Instancias de modelos
 # ================================
-num_seg = 5  # nodos
+num_seg = 12  # nodos
 degree = 3      # grado B-Spline
 
 bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, use_intercept=False)
@@ -266,7 +366,7 @@ for k in range(nb - 2):
     D[k, k + 1] = -2.0
     D[k, k + 2] = 1.0
 
-lam = 1e-3  # fuerza de suavidad (ajustable)
+lam = 1e-4#1e-3  # fuerza de suavidad (ajustable)
 
 A = B.T @ B + lam * (D.T @ D) + 1e-6 * np.eye(nb, dtype=np.float32)
 c = B.T @ y_vec
@@ -303,8 +403,8 @@ plot_comparison(
 # Red neuronal (random effects a,b,c)
 inp_deep = 20
 out_deep = 3
-nodes_deep = [15, out_deep]
-acts = ['tanh',  'linear']
+nodes_deep = [20,20, out_deep]
+acts = ['tanh', 'tanh',  'linear']
 
 model_deep = Sequential(name="DeepRandEffects")
 for i, (units, act) in enumerate(zip(nodes_deep, acts)):
@@ -518,3 +618,73 @@ cov_real_2.to_csv(RESULTS_DIR / f'covariance_nj_20_seg_{num_seg}_nind_{data_s}_o
 fixed_est_df.to_csv(RESULTS_DIR / f'fixed_effects_nj_20_seg_{num_seg}_nind_{data_s}_org.csv', index=False)
 rand_eff_training.to_csv(RESULTS_DIR / f're_training_nj_20_seg_{num_seg}_nind_{data_s}_org.csv', index=False)
 rand_eff_val.to_csv(RESULTS_DIR / f're_val_nj_20_seg_{num_seg}_nind_{data_s}_org.csv', index=False)
+
+
+# ================================
+# Verificación numérica: condición natural f'' ≈ 0 en extremos
+# ================================
+dx = 1e-3  # paso pequeño para diferencias finitas
+x_left, x_right = domain[0], domain[1]
+
+# Evaluar spline alrededor de los extremos
+x_vals_left = np.array([x_left, x_left + dx, x_left + 2*dx], dtype=np.float32)
+x_vals_right = np.array([x_right - 2*dx, x_right - dx, x_right], dtype=np.float32)
+
+y_left = bspline_layer(tf.constant(x_vals_left, dtype=tf.float32)).numpy()
+y_right = bspline_layer(tf.constant(x_vals_right, dtype=tf.float32)).numpy()
+
+# Segunda derivada aproximada: f'' ≈ (y_{i+2} - 2*y_{i+1} + y_i) / dx^2
+f2_left = (y_left[2] - 2*y_left[1] + y_left[0]) / dx**2
+f2_right = (y_right[2] - 2*y_right[1] + y_right[0]) / dx**2
+
+print(f"Segunda derivada en extremo izquierdo ({x_left:.4f}): {float(f2_left):.6f}")
+print(f"Segunda derivada en extremo derecho ({x_right:.4f}): {float(f2_right):.6f}")
+
+# ================================
+# Visualización de la segunda derivada en todo el dominio
+# ================================
+a, b = domain
+N = 1000                     # muchos puntos
+x_grid = np.linspace(a, b, N, dtype=np.float32)
+y_values = bspline_layer(tf.constant(x_grid)).numpy().ravel()
+
+dx_grid = x_grid[1] - x_grid[0]
+
+# Primera y segunda derivada
+f1 = np.gradient(y_values, dx_grid)      # f'
+f2 = np.gradient(f1, dx_grid)            # f''
+
+# Valores en los extremos
+f2_left = f2[0]
+f2_right = f2[-1]
+
+print(f"Segunda derivada en extremo izquierdo ({a:.4f}): {f2_left:.6f}")
+print(f"Segunda derivada en extremo derecho  ({b:.4f}): {f2_right:.6f}")
+
+
+plt.figure(figsize=(10, 5))
+plt.plot(x_values, f2, label="Segunda derivada")
+plt.axhline(0, color="red", linestyle="--", label="Cero")
+plt.scatter([x_left, x_right], [f2_left, f2_right], color="black", zorder=5, label="Extremos")
+plt.title("Verificación condición natural: f''(a)=f''(b)=0")
+plt.xlabel("x")
+plt.ylabel("Segunda derivada")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, natural=True)
+
+# Extraer C y R (hay que reconstruir C en este caso)
+C = bspline_layer._build_C_second_deriv_matrix(domain[0], domain[1])
+R = bspline_layer.R.numpy()
+
+print("Matriz C (2 x num_bases):")
+print(C)
+print("\nProducto C @ R:")
+print(C @ R)
+
+# Norma del residuo
+residuo = np.linalg.norm(C @ R)
+print(f"\nNorma de C @ R: {residuo:.2e}")
