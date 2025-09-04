@@ -368,7 +368,7 @@ D = np.zeros((nb - 2, nb), dtype=np.float32)
 for k in range(nb - 2):
     D[k, k:k+3] = (1.0, -2.0, 1.0)
 
-lam = 1e-3#1e-3, 1e-4  # fuerza de suavidad (ajustable)
+lam = 1e-4#1e-3, 1e-4  # fuerza de suavidad (ajustable)
 
 if bspline_layer.natural:
     R = bspline_layer.R.numpy()            # [nb, nb-2]
