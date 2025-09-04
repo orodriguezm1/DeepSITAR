@@ -55,9 +55,9 @@ t_s = int(data_s * train_frac)
 #lr = [1e-3, 1e-4]   # learning rates por fase
 #b_size = 100        # batch size
 
-epp = [5000,8000, 10000] # Épocas para cada fase de entrenamiento
+epp = [5000,8000, 5000] # Épocas para cada fase de entrenamiento
 #epp = [5000,5000, 5000] # Épocas para cada fase de entrenamiento
-lr =  [1e-3, 1e-4, 1e-5]     # Tasas de aprendizaje para cada fase
+lr =  [1e-2, 1e-4, 1e-5]     # Tasas de aprendizaje para cada fase
 b_size = 100          # Tamaño del batch
 
 
@@ -190,11 +190,14 @@ class BSplineLayer(tf.keras.layers.Layer):
 
         # Nudos (uniformes extendidos como en tu código)
         span = (self.domain[1] - self.domain[0])
-        self.knots = np.linspace(
-            self.domain[0] - self.degree * (span / self.num_seg),
-            self.domain[1] + self.degree * (span / self.num_seg),
-            self.num_bases + self.degree + 1
-        ).astype(np.float32)
+        dx = span / self.num_seg
+
+        self.knots = np.arange(
+            self.domain[0] - self.degree * dx- dx / 2,
+            self.domain[1] + self.degree * dx + dx / 2,  # +dx/2 para incluir el último nudo
+            dx,
+            dtype=np.float32
+        )
 
         # Variables entrenables: si natural -> parámetros reducidos; si no, coeficientes completos
         if self.natural:
@@ -335,8 +338,8 @@ class BSplineLayer(tf.keras.layers.Layer):
 # ================================
 #  Instancias de modelos
 # ================================
-num_seg = 12  # nodos
-degree = 3      # grado B-Spline
+num_seg = 10 # nodos
+degree = 3     # grado B-Spline
 
 bspline_layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, use_intercept=False)
 
@@ -360,26 +363,32 @@ B = np.stack(B_cols, axis=1).astype(np.float32)                # [N, nb]
 y_vec = Y_training.numpy().ravel().astype(np.float32)[:, None] # [N, 1]
 nb = B.shape[1]
 
+# Matriz de suavidad (Δ²)
 D = np.zeros((nb - 2, nb), dtype=np.float32)
 for k in range(nb - 2):
-    D[k, k]     = 1.0
-    D[k, k + 1] = -2.0
-    D[k, k + 2] = 1.0
+    D[k, k:k+3] = (1.0, -2.0, 1.0)
 
-lam = 1e-4#1e-3  # fuerza de suavidad (ajustable)
+lam = 1e-3#1e-3, 1e-4  # fuerza de suavidad (ajustable)
 
-A = B.T @ B + lam * (D.T @ D) + 1e-6 * np.eye(nb, dtype=np.float32)
-c = B.T @ y_vec
-try:
-    cp_init = np.linalg.solve(A, c).astype(np.float32)  # [nb, 1]
-except np.linalg.LinAlgError:
-    cp_init, *_ = np.linalg.lstsq(A, c, rcond=None)
-    cp_init = cp_init.astype(np.float32)
+if bspline_layer.natural:
+    R = bspline_layer.R.numpy()            # [nb, nb-2]
+    BR = B @ R                              # [N, nb-2]
+    DR = D @ R                              # [(nb-2), nb-2]
+    A = BR.T @ BR + lam * (DR.T @ DR) + 1e-6*np.eye(R.shape[1], dtype=np.float32)
+    c_rhs = BR.T @ y_vec
+    theta = np.linalg.solve(A, c_rhs).astype(np.float32)  # [(nb-2),1]
+    cp_init = (R @ theta).astype(np.float32)              # [nb,1]
+    bspline_layer.control_points_reduced.assign(theta)    # guarda θ
+else:
+    A = B.T @ B + lam * (D.T @ D) + 1e-6*np.eye(nb, dtype=np.float32)
+    c_rhs = B.T @ y_vec
+    cp_init = np.linalg.solve(A, c_rhs).astype(np.float32)
+    bspline_layer.control_points.assign(cp_init)
 
 bspline_layer.control_points.assign(cp_init)
 
 # Ploteo de la curva B-spline pre-entrenada
-x_values_pre = np.linspace(domain[0] - 4, domain[1] + 4, 400).astype(np.float32)
+x_values_pre = np.linspace(domain[0], domain[1], 400).astype(np.float32)
 y_pre = bspline_layer(tf.constant(x_values_pre, dtype=tf.float32)).numpy()
 fig, ax = plt.subplots(figsize=(10, 6))
 for i in range(basis_count):
@@ -404,7 +413,7 @@ plot_comparison(
 inp_deep = 20
 out_deep = 3
 nodes_deep = [20,20, out_deep]
-acts = ['tanh', 'tanh',  'linear']
+acts = ['tanh', 'tanh', 'linear']
 
 model_deep = Sequential(name="DeepRandEffects")
 for i, (units, act) in enumerate(zip(nodes_deep, acts)):
@@ -519,7 +528,7 @@ ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1),
 save_and_show(fig, PLOTS_DIR / f'plot_compare_estim_{num_seg}.pdf', dpi=300)
 
 # Visualización FINAL: bases + curva B-spline ENTRENADA
-x_values = np.linspace(domain[0] - 4, domain[1] + 4, 400).astype(np.float32)
+x_values = np.linspace(domain[0], domain[1], 400).astype(np.float32)
 x_tensor = tf.constant(x_values, dtype=tf.float32)
 fig, ax = plt.subplots(figsize=(10, 6))
 basis_count = bspline_layer.num_bases
@@ -619,3 +628,44 @@ fixed_est_df.to_csv(RESULTS_DIR / f'fixed_effects_nj_20_seg_{num_seg}_nind_{data
 rand_eff_training.to_csv(RESULTS_DIR / f're_training_nj_20_seg_{num_seg}_nind_{data_s}_org.csv', index=False)
 rand_eff_val.to_csv(RESULTS_DIR / f're_val_nj_20_seg_{num_seg}_nind_{data_s}_org.csv', index=False)
 
+
+# ================================
+# Verificación numérica: condición natural f'' ≈ 0 en extremos
+# ================================
+# Creamos una malla fina de evaluación
+layer = BSplineLayer(num_seg=num_seg, degree=degree, domain=domain, natural=True)
+
+x_grid = np.linspace(domain[0], domain[1], 500).astype(np.float32)
+
+# Evaluamos la salida del spline (con pesos iniciales aleatorios)
+y_values = layer(x_grid).numpy().flatten()
+
+# Paso de malla
+dx = x_grid[1] - x_grid[0]
+
+# Derivadas numéricas
+f1 = np.gradient(y_values, dx)
+f2 = np.gradient(f1, dx)
+
+print("Segunda derivada en extremo izquierdo (a):", f2[0])
+print("Segunda derivada en extremo derecho (b):", f2[-1])
+
+# Chequeo tolerancia
+tol = 1e-2
+print("¿Cumple condición natural en a?", abs(f2[0]) < tol)
+print("¿Cumple condición natural en b?", abs(f2[-1]) < tol)
+
+
+# Usamos la misma malla que para las derivadas
+x_plot = np.linspace(domain[0], domain[1], 500)
+
+plt.figure(figsize=(10, 5))
+plt.plot(x_plot, f2, label="Segunda derivada")
+plt.axhline(0, color="red", linestyle="--", label="Cero")
+plt.scatter([domain[0], domain[1]], [f2[0], f2[-1]], color="black", zorder=5, label="Extremos")
+plt.title("Verificación condición natural: f''(a)=f''(b)=0")
+plt.xlabel("x")
+plt.ylabel("Segunda derivada")
+plt.legend()
+plt.grid(True)
+plt.show()
